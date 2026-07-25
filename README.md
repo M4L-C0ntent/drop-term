@@ -55,7 +55,6 @@ the following on top:
 | `Ctrl+Shift+W` | Close tab |
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+Shift+Tab` | Previous tab |
-| `Ctrl+Shift+P` | Toggle pin |
 | `Ctrl+Shift+C` | Copy selection |
 | `Ctrl+Shift+V` | Paste |
 | `F12` | Hide the dropdown (only while it already has focus) |
