@@ -13,7 +13,7 @@ terminal emulation core, rendered with a custom canvas in
   color chart for the `user@host` and current-directory portions of the
   shell prompt.
 - Toggle the applet from anywhere on the desktop via an OS-level keyboard
-  shortcut (see below) — not just while it already has focus
+  shortcut (see below)
 
 ## Installing
 
