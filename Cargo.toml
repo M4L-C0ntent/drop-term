@@ -1,0 +1,25 @@
+[package]
+name = "drop-term"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+dirs = "6"
+alacritty_terminal = "0.26"
+i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10"
+rust-embed = "8"
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+default-features = false
+features = ["applet", "tokio", "wayland"]
+
+[profile.release]
+lto = true
+strip = true

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Drop Term
+Comment=Drop-down terminal applet
+Type=Application
+Exec=drop-term
+Terminal=false
+Categories=COSMIC;
+Icon=utilities-terminal-symbolic
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
