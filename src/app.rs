@@ -867,7 +867,7 @@ impl cosmic::Application for App {
                 if let Some(text) = content {
                     if let Some(tab) = self.tabs.get(self.active_tab) {
                         if let Some(entry) = tab.panes.get(&tab.active_pane) {
-                            entry.terminal.write_input(text.as_bytes());
+                            entry.terminal.paste(&text);
                         }
                     }
                 }

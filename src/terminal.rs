@@ -4,7 +4,7 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, Windo
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty;
 use cosmic::iced::widget::canvas;
 use std::sync::Arc;
@@ -132,6 +132,20 @@ impl Terminal {
 
     pub fn write_input(&self, data: &[u8]) {
         self.notifier.notify(data.to_vec());
+    }
+
+    pub fn paste(&self, text: &str) {
+        let sanitized = text.replace("\x1b[201~", "");
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if bracketed {
+            let mut data = Vec::with_capacity(sanitized.len() + 12);
+            data.extend_from_slice(b"\x1b[200~");
+            data.extend_from_slice(sanitized.as_bytes());
+            data.extend_from_slice(b"\x1b[201~");
+            self.write_input(&data);
+        } else {
+            self.write_input(sanitized.as_bytes());
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
