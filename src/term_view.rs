@@ -21,6 +21,7 @@ pub struct TerminalView<'a> {
 // Green (index 2/10, NamedColor::Green/BrightGreen/DimGreen) and Blue
 // (index 4/12, NamedColor::Blue/BrightBlue/DimBlue) are overridden by the
 // user's configured colors — the conventional ANSI slots the default
+// Debian/Ubuntu bash prompt uses for user@host and the working directory.
 fn resolve_color(
     c: AnsiColor,
     default: Color,
@@ -120,6 +121,16 @@ fn flush_run(frame: &mut canvas::Frame, run: GlyphRun, default_bg: Color) {
     }
 }
 
+// Holds just what draw_frame needs per cell after resolving color, so the
+// terminal lock can be released before any Frame/text-shaping work runs.
+struct CellSnap {
+    line: i32,
+    col: usize,
+    c: char,
+    fg: Color,
+    bg: Color,
+}
+
 #[derive(Default)]
 pub struct TermViewState {
     dragging: bool,
@@ -128,6 +139,10 @@ pub struct TermViewState {
 impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<'a> {
     type State = TermViewState;
 
+    // NOTE: Selection/Side/SelectionType paths and Selection::update's exact
+    // signature are best-effort guesses against alacritty_terminal 0.26 —
+    // expect to need one more correction round here, consistent with the
+    // rest of this crate's API surface throughout this build.
     fn update(
         &self,
         state: &mut TermViewState,
@@ -219,51 +234,76 @@ impl<'a> TerminalView<'a> {
             Color::from_rgb8(30, 30, 30),
         );
 
-        let term = self.terminal.term.lock();
-        let selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
-        let content = term.renderable_content();
-        let cursor_point = content.cursor.point;
-        let display_offset = content.display_offset;
         let default_bg = Color::from_rgb8(30, 30, 30);
+
+        // Snapshot resolved per-cell color/text while the terminal is
+        // locked, bounded by the visible viewport (not scrollback), then
+        // release the lock before any Frame/text-shaping work below.
+        // alacritty's PTY reader thread needs this same lock to write
+        // incoming bytes into the grid — holding it for the whole draw
+        // pass serialized rendering against new output arriving, which is
+        // exactly what nano's rapid repaints would stall on.
+        let (cells, total_lines, screen_lines, display_offset) = {
+            let term = self.terminal.term.lock();
+            let selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
+            let content = term.renderable_content();
+            let cursor_point = content.cursor.point;
+            let display_offset = content.display_offset;
+
+            let cells: Vec<CellSnap> = content
+                .display_iter
+                .map(|cell| {
+                    let is_cursor = cell.point == cursor_point;
+                    let is_selected = selection_range
+                        .map(|r| r.contains(cell.point))
+                        .unwrap_or(false);
+                    let mut fg =
+                        resolve_color(cell.fg, Color::WHITE, self.user_host_color, self.directory_color);
+                    let mut bg = resolve_color(cell.bg, default_bg, self.user_host_color, self.directory_color);
+                    if cell.flags.contains(Flags::INVERSE) || is_cursor || is_selected {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    CellSnap {
+                        line: cell.point.line.0,
+                        col: cell.point.column.0,
+                        c: cell.c,
+                        fg,
+                        bg,
+                    }
+                })
+                .collect();
+
+            (cells, term.grid().total_lines(), term.grid().screen_lines(), display_offset)
+        }; // terminal lock released here
 
         let mut run: Option<GlyphRun> = None;
         let mut last_cell: Option<(i32, usize)> = None;
 
-        for cell in content.display_iter {
-            let line = cell.point.line.0;
-            let col = cell.point.column.0;
-            let x = col as f32 * CELL_WIDTH;
-            let y = (line + display_offset as i32) as f32 * CELL_HEIGHT;
-            let is_cursor = cell.point == cursor_point;
-            let is_selected = selection_range
-                .map(|r| r.contains(cell.point))
-                .unwrap_or(false);
+        for cell in cells {
+            let x = cell.col as f32 * CELL_WIDTH;
+            let y = (cell.line + display_offset as i32) as f32 * CELL_HEIGHT;
 
-            let mut fg = resolve_color(cell.fg, Color::WHITE, self.user_host_color, self.directory_color);
-            let mut bg = resolve_color(cell.bg, default_bg, self.user_host_color, self.directory_color);
-            if cell.flags.contains(Flags::INVERSE) || is_cursor || is_selected {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-
-            let contiguous = last_cell.map_or(false, |(l, c)| l == line && c + 1 == col);
+            let contiguous = last_cell.map_or(false, |(l, c)| l == cell.line && c + 1 == cell.col);
             let same_run = contiguous
-                && run.as_ref().map_or(false, |r| r.fg == fg && r.bg == bg);
+                && run.as_ref().map_or(false, |r| r.fg == cell.fg && r.bg == cell.bg);
 
             if !same_run {
                 if let Some(r) = run.take() {
                     flush_run(frame, r, default_bg);
                 }
-                run = Some(GlyphRun { start_x: x, y, fg, bg, text: String::new() });
+                run = Some(GlyphRun { start_x: x, y, fg: cell.fg, bg: cell.bg, text: String::new() });
             }
             run.as_mut().unwrap().text.push(cell.c);
-            last_cell = Some((line, col));
+            last_cell = Some((cell.line, cell.col));
         }
         if let Some(r) = run.take() {
             flush_run(frame, r, default_bg);
         }
 
-        let total_lines = term.grid().total_lines();
-        let screen_lines = term.grid().screen_lines();
+        // NOTE: RenderableContent's exact field name for the current scroll
+        // offset (assumed `display_offset` here) should be checked against
+        // docs.rs for the pinned alacritty_terminal version if this doesn't
+        // compile.
         if total_lines > screen_lines {
             let track_height = bounds.height;
             let thumb_height =
