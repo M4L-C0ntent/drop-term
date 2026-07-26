@@ -10,6 +10,7 @@ use cosmic::{Element, Renderer, Theme};
 
 pub struct TerminalView<'a> {
     pub terminal: &'a Terminal,
+    pub pane_id: crate::pane::PaneId,
     pub user_host_color: Color,
     pub directory_color: Color,
 }
@@ -117,7 +118,10 @@ impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<
                 self.terminal.term.lock().selection =
                     Some(Selection::new(SelectionType::Simple, point, Side::Left));
                 state.dragging = true;
-                Some(canvas::Action::publish(crate::app::Message::TerminalUpdated))
+                self.terminal.invalidate();
+                Some(canvas::Action::publish(crate::app::Message::TerminalUpdated(
+                    self.pane_id,
+                )))
             }
             MouseEvent::CursorMoved { .. } if state.dragging => {
                 let position = cursor.position()?;
@@ -127,7 +131,11 @@ impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<
                 if let Some(selection) = term.selection.as_mut() {
                     selection.update(point, Side::Left);
                 }
-                Some(canvas::Action::publish(crate::app::Message::TerminalUpdated))
+                drop(term);
+                self.terminal.invalidate();
+                Some(canvas::Action::publish(crate::app::Message::TerminalUpdated(
+                    self.pane_id,
+                )))
             }
             MouseEvent::ButtonReleased(Button::Left) => {
                 state.dragging = false;
@@ -158,16 +166,28 @@ impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<
         bounds: Rectangle,
         _cursor: cosmic::iced::mouse::Cursor,
     ) -> Vec<Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let cols = ((bounds.width / CELL_WIDTH) as u16).max(1);
+        let rows = ((bounds.height / CELL_HEIGHT) as u16).max(1);
+        self.terminal.resize_if_changed(cols, rows);
+
+        let geometry = self.terminal.redraw_cache.draw(renderer, bounds.size(), |frame| {
+            self.draw_frame(frame, bounds);
+        });
+
+        vec![geometry]
+    }
+}
+
+impl<'a> TerminalView<'a> {
+    /// The actual per-glyph render, pulled out of draw() so it only runs
+    /// through redraw_cache.draw() above — i.e. only when invalidate() was
+    /// called for THIS pane, not on every unrelated app message.
+    fn draw_frame(&self, frame: &mut canvas::Frame, bounds: Rectangle) {
         frame.fill_rectangle(
             cosmic::iced::Point::ORIGIN,
             bounds.size(),
             Color::from_rgb8(30, 30, 30),
         );
-
-        let cols = ((bounds.width / CELL_WIDTH) as u16).max(1);
-        let rows = ((bounds.height / CELL_HEIGHT) as u16).max(1);
-        self.terminal.resize_if_changed(cols, rows);
 
         let term = self.terminal.term.lock();
         let selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
@@ -237,18 +257,18 @@ impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<
                 Color::from_rgba(1.0, 1.0, 1.0, 0.35),
             );
         }
-
-        vec![frame.into_geometry()]
     }
 }
 
 pub fn terminal_canvas(
     terminal: &Terminal,
+    pane_id: crate::pane::PaneId,
     user_host_color: Color,
     directory_color: Color,
 ) -> Element<'_, crate::app::Message> {
     Canvas::new(TerminalView {
         terminal,
+        pane_id,
         user_host_color,
         directory_color,
     })

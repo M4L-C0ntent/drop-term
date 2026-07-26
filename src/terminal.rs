@@ -6,6 +6,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::tty;
+use cosmic::iced::widget::canvas;
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -42,6 +43,13 @@ pub struct Terminal {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: Notifier,
     last_size: std::cell::Cell<(u16, u16)>,
+    /// Caches the rendered glyph/rect geometry so an idle pane costs nothing
+    /// to redraw. Without this, canvas::Program::draw reshapes every glyph
+    /// on the grid on every wakeup from ANY pane, which is what made nano's
+    /// constant full-screen repaints lag. Cleared via `invalidate()` only
+    /// when this specific pane's content, selection, or scroll actually
+    /// changes.
+    pub redraw_cache: canvas::Cache,
 }
 
 fn default_shell() -> String {
@@ -109,9 +117,17 @@ impl Terminal {
                 term,
                 notifier,
                 last_size: std::cell::Cell::new((cols, rows)),
+                redraw_cache: canvas::Cache::new(),
             },
             rx,
         )
+    }
+
+    /// Drops the cached geometry so the next draw() call rebuilds it. Call
+    /// whenever this pane's visible content, selection, or scroll offset
+    /// changes — not on unrelated app messages, which is the whole point.
+    pub fn invalidate(&self) {
+        self.redraw_cache.clear();
     }
 
     pub fn write_input(&self, data: &[u8]) {
@@ -125,6 +141,7 @@ impl Terminal {
             .notifier
             .0
             .send(Msg::Resize(window_size(cols, rows)));
+        self.invalidate();
     }
 
     /// Only issues an actual resize if the size changed since last applied —
@@ -142,6 +159,7 @@ impl Terminal {
         self.term
             .lock()
             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        self.invalidate();
     }
 
     // NOTE: `selection_to_string` is assumed to exist on Term for pulling the

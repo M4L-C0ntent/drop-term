@@ -60,7 +60,7 @@ pub enum Message {
     SurfaceUnfocused(window::Id),
     TogglePin,
     Resized(window::Id, u32, u32),
-    TerminalUpdated,
+    TerminalUpdated(PaneId),
     KeyPressed(keyboard::Key, keyboard::Modifiers, Option<String>),
     SplitPane(SplitDirection),
     ClosePane(PaneId),
@@ -157,7 +157,7 @@ fn term_event_stream(data: &TermSubData) -> impl cosmic::iced::futures::Stream<I
         let event = rx.lock().await.recv().await?;
         let message = match event {
             TermEvent::Exit => Message::ClosePane(pane_id),
-            _ => Message::TerminalUpdated,
+            _ => Message::TerminalUpdated(pane_id),
         };
         Some((message, rx))
     })
@@ -237,6 +237,7 @@ impl App {
         let is_active = id == active_pane;
         let framed = widget::container(crate::term_view::terminal_canvas(
             &entry.terminal,
+            id,
             user_host_color,
             directory_color,
         ))
@@ -571,7 +572,15 @@ impl cosmic::Application for App {
                 self.recompute_layout();
                 Task::none()
             }
-            Message::TerminalUpdated => Task::none(),
+            Message::TerminalUpdated(id) => {
+                for tab in &self.tabs {
+                    if let Some(entry) = tab.panes.get(&id) {
+                        entry.terminal.invalidate();
+                        break;
+                    }
+                }
+                Task::none()
+            }
             Message::SplitPane(SplitDirection::Horizontal) => {
                 let Some(tab) = self.tabs.get(self.active_tab) else {
                     return Task::none();
