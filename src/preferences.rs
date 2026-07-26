@@ -6,7 +6,12 @@ use cosmic::widget;
 
 pub fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
     let s = s.trim().trim_start_matches('#');
-    if s.len() != 6 {
+    // ASCII-only check first: a 6-*byte* string containing multi-byte UTF-8
+    // characters (e.g. two 3-byte chars) can have byte length 6 without its
+    // char boundaries landing on 0/2/4/6, which would panic the byte slices
+    // below. Once every byte is confirmed single-byte ASCII, those offsets
+    // are always safe.
+    if !s.is_ascii() || s.len() != 6 {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
