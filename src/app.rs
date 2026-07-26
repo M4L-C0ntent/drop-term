@@ -230,7 +230,7 @@ impl App {
                 let pane_rows = (window_rows / num_rows).max(1);
                 for id in column {
                     if let Some(entry) = tab.panes.get(id) {
-                        entry.terminal.resize(pane_cols, pane_rows);
+                        entry.terminal.resize_if_changed(pane_cols, pane_rows);
                     }
                 }
             }
