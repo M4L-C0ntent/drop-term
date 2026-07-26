@@ -21,7 +21,6 @@ pub struct TerminalView<'a> {
 // Green (index 2/10, NamedColor::Green/BrightGreen/DimGreen) and Blue
 // (index 4/12, NamedColor::Blue/BrightBlue/DimBlue) are overridden by the
 // user's configured colors — the conventional ANSI slots the default
-// Debian/Ubuntu bash prompt uses for user@host and the working directory.
 fn resolve_color(
     c: AnsiColor,
     default: Color,
@@ -86,6 +85,41 @@ fn position_to_point(
     GridPoint::new(Line(row), Column(col))
 }
 
+// Accumulates consecutive same-(fg,bg) cells on a row so they render as one
+// glyph run instead of one shaping call per character. Positioned by grid
+// column (start_x), not by cumulative glyph advance, so a run always starts
+// exactly on-grid regardless of font metrics — only intra-run spacing
+// depends on the monospace font's advance matching CELL_WIDTH, which this
+// file already assumes everywhere (PTY sizing, mouse-to-cell mapping).
+struct GlyphRun {
+    start_x: f32,
+    y: f32,
+    fg: Color,
+    bg: Color,
+    text: String,
+}
+
+fn flush_run(frame: &mut canvas::Frame, run: GlyphRun, default_bg: Color) {
+    let len = run.text.chars().count() as f32;
+    if run.bg != default_bg {
+        frame.fill_rectangle(
+            cosmic::iced::Point::new(run.start_x, run.y),
+            cosmic::iced::Size::new(CELL_WIDTH * len, CELL_HEIGHT),
+            run.bg,
+        );
+    }
+    if run.text.chars().any(|c| c != ' ') {
+        frame.fill_text(canvas::Text {
+            content: run.text,
+            position: cosmic::iced::Point::new(run.start_x, run.y),
+            color: run.fg,
+            size: cosmic::iced::Pixels(CELL_HEIGHT * 0.85),
+            font: cosmic::iced::Font::MONOSPACE,
+            ..Default::default()
+        });
+    }
+}
+
 #[derive(Default)]
 pub struct TermViewState {
     dragging: bool,
@@ -94,10 +128,6 @@ pub struct TermViewState {
 impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<'a> {
     type State = TermViewState;
 
-    // NOTE: Selection/Side/SelectionType paths and Selection::update's exact
-    // signature are best-effort guesses against alacritty_terminal 0.26 —
-    // expect to need one more correction round here, consistent with the
-    // rest of this crate's API surface throughout this build.
     fn update(
         &self,
         state: &mut TermViewState,
@@ -194,50 +224,44 @@ impl<'a> TerminalView<'a> {
         let content = term.renderable_content();
         let cursor_point = content.cursor.point;
         let display_offset = content.display_offset;
+        let default_bg = Color::from_rgb8(30, 30, 30);
+
+        let mut run: Option<GlyphRun> = None;
+        let mut last_cell: Option<(i32, usize)> = None;
 
         for cell in content.display_iter {
-            let x = cell.point.column.0 as f32 * CELL_WIDTH;
-            let y = (cell.point.line.0 + display_offset as i32) as f32 * CELL_HEIGHT;
+            let line = cell.point.line.0;
+            let col = cell.point.column.0;
+            let x = col as f32 * CELL_WIDTH;
+            let y = (line + display_offset as i32) as f32 * CELL_HEIGHT;
             let is_cursor = cell.point == cursor_point;
             let is_selected = selection_range
                 .map(|r| r.contains(cell.point))
                 .unwrap_or(false);
 
             let mut fg = resolve_color(cell.fg, Color::WHITE, self.user_host_color, self.directory_color);
-            let mut bg = resolve_color(
-                cell.bg,
-                Color::from_rgb8(30, 30, 30),
-                self.user_host_color,
-                self.directory_color,
-            );
+            let mut bg = resolve_color(cell.bg, default_bg, self.user_host_color, self.directory_color);
             if cell.flags.contains(Flags::INVERSE) || is_cursor || is_selected {
                 std::mem::swap(&mut fg, &mut bg);
             }
 
-            if bg != Color::from_rgb8(30, 30, 30) || is_cursor || is_selected {
-                frame.fill_rectangle(
-                    cosmic::iced::Point::new(x, y),
-                    cosmic::iced::Size::new(CELL_WIDTH, CELL_HEIGHT),
-                    bg,
-                );
-            }
+            let contiguous = last_cell.map_or(false, |(l, c)| l == line && c + 1 == col);
+            let same_run = contiguous
+                && run.as_ref().map_or(false, |r| r.fg == fg && r.bg == bg);
 
-            if cell.c != ' ' {
-                frame.fill_text(canvas::Text {
-                    content: cell.c.to_string(),
-                    position: cosmic::iced::Point::new(x, y),
-                    color: fg,
-                    size: cosmic::iced::Pixels(CELL_HEIGHT * 0.85),
-                    font: cosmic::iced::Font::MONOSPACE,
-                    ..Default::default()
-                });
+            if !same_run {
+                if let Some(r) = run.take() {
+                    flush_run(frame, r, default_bg);
+                }
+                run = Some(GlyphRun { start_x: x, y, fg, bg, text: String::new() });
             }
+            run.as_mut().unwrap().text.push(cell.c);
+            last_cell = Some((line, col));
+        }
+        if let Some(r) = run.take() {
+            flush_run(frame, r, default_bg);
         }
 
-        // NOTE: RenderableContent's exact field name for the current scroll
-        // offset (assumed `display_offset` here) should be checked against
-        // docs.rs for the pinned alacritty_terminal version if this doesn't
-        // compile.
         let total_lines = term.grid().total_lines();
         let screen_lines = term.grid().screen_lines();
         if total_lines > screen_lines {
