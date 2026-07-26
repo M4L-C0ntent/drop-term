@@ -48,6 +48,11 @@ pub struct App {
     next_pane_id: PaneId,
     pinned: bool,
     surface_opened_at: Option<Instant>,
+    /// Bumped on every resize event; a debounced save only writes if this
+    /// still matches its own generation after the delay, so a live drag
+    /// resize (many events/sec) doesn't do a synchronous disk write per
+    /// frame — only once, ~300ms after resizing settles.
+    resize_save_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +444,7 @@ impl cosmic::Application for App {
                 next_pane_id: 0,
                 pinned: false,
                 surface_opened_at: None,
+                resize_save_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             Task::none(),
         )
@@ -581,8 +587,31 @@ impl cosmic::Application for App {
                 }
                 self.config.window_width = width.max(500);
                 self.config.window_height = height.max(300);
-                crate::config::save(&self.config);
                 self.recompute_layout();
+
+                // A live drag-resize fires this event continuously; only
+                // persist once it's been quiet for a moment, off the UI
+                // thread, instead of a synchronous serialize+fs::write per
+                // frame. If a newer resize supersedes this one before the
+                // delay elapses, the generation check below skips the
+                // stale write — the newest one always wins.
+                // NOTE: assumes cosmic::executor::Default keeps a Tokio
+                // runtime entered for the app's lifetime (tokio is already
+                // a direct dependency here for exactly this reason); if
+                // tokio::spawn ever panics with "no reactor running", this
+                // needs a Handle threaded in explicitly instead.
+                let generation = self
+                    .resize_save_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let generation_handle = self.resize_save_generation.clone();
+                let config_snapshot = self.config.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if generation_handle.load(std::sync::atomic::Ordering::SeqCst) == generation {
+                        crate::config::save(&config_snapshot);
+                    }
+                });
                 Task::none()
             }
             Message::TerminalUpdated(id) => {
