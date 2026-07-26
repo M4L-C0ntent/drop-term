@@ -154,12 +154,25 @@ fn term_event_stream(data: &TermSubData) -> impl cosmic::iced::futures::Stream<I
     let rx = data.rx.clone();
     let pane_id = data.id;
     stream::unfold(rx, move |rx| async move {
-        let event = rx.lock().await.recv().await?;
-        let message = match event {
-            TermEvent::Exit => Message::ClosePane(pane_id),
-            _ => Message::TerminalUpdated(pane_id),
-        };
-        Some((message, rx))
+        let mut guard = rx.lock().await;
+        let first = guard.recv().await?;
+        if matches!(first, TermEvent::Exit) {
+            drop(guard);
+            return Some((Message::ClosePane(pane_id), rx));
+        }
+        // A full-screen repaint (nano, vim scrolling, a big `cat`) can queue
+        // many wakeups within one frame; they'd all collapse to the same
+        // redraw anyway via the cache from Section 1, so drain the rest
+        // (non-blocking) and emit just one message instead of running a
+        // full update/view/layout pass per PTY chunk.
+        while let Ok(next) = guard.try_recv() {
+            if matches!(next, TermEvent::Exit) {
+                drop(guard);
+                return Some((Message::ClosePane(pane_id), rx));
+            }
+        }
+        drop(guard);
+        Some((Message::TerminalUpdated(pane_id), rx))
     })
 }
 
