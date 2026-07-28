@@ -100,8 +100,22 @@ struct GlyphRun {
     text: String,
 }
 
-fn flush_run(frame: &mut canvas::Frame, run: GlyphRun, default_bg: Color) {
-    let len = run.text.chars().count() as f32;
+fn flush_run(frame: &mut canvas::Frame, run: GlyphRun, default_bg: Color, max_width: f32) {
+    // Never draw past this pane's own right edge. CELL_WIDTH is a fixed
+    // guess at the monospace font's advance, not a measured value — if the
+    // real glyph width is even slightly wider, a line sized to fit the
+    // reported column count can overflow in actual pixels and bleed into
+    // whatever renders next (a neighboring split pane). Clip here so that's
+    // contained regardless of the underlying metric mismatch.
+    if run.start_x >= max_width {
+        return;
+    }
+    let available_cols = ((max_width - run.start_x) / CELL_WIDTH).floor().max(0.0) as usize;
+    if available_cols == 0 {
+        return;
+    }
+    let chars: Vec<char> = run.text.chars().take(available_cols).collect();
+    let len = chars.len() as f32;
     if run.bg != default_bg {
         frame.fill_rectangle(
             cosmic::iced::Point::new(run.start_x, run.y),
@@ -109,10 +123,21 @@ fn flush_run(frame: &mut canvas::Frame, run: GlyphRun, default_bg: Color) {
             run.bg,
         );
     }
-    if run.text.chars().any(|c| c != ' ') {
+    // Each glyph is placed explicitly at its own exact grid column instead
+    // of one fill_text call trusting the font's natural multi-character
+    // advance to match CELL_WIDTH. A batched call was cheaper, but even a
+    // small per-glyph metric error compounds across a run's length, and
+    // once the drift exceeds a fraction of a cell it visually overlaps
+    // into the next same-line color run — that was the cause of the
+    // garbled/overlapping text. Per-glyph positioning is exact regardless
+    // of the font's real advance.
+    for (i, ch) in chars.into_iter().enumerate() {
+        if ch == ' ' {
+            continue;
+        }
         frame.fill_text(canvas::Text {
-            content: run.text,
-            position: cosmic::iced::Point::new(run.start_x, run.y),
+            content: ch.to_string(),
+            position: cosmic::iced::Point::new(run.start_x + i as f32 * CELL_WIDTH, run.y),
             color: run.fg,
             size: cosmic::iced::Pixels(CELL_HEIGHT * 0.85),
             font: cosmic::iced::Font::MONOSPACE,
@@ -129,6 +154,7 @@ struct CellSnap {
     c: char,
     fg: Color,
     bg: Color,
+    is_cursor: bool,
 }
 
 #[derive(Default)]
@@ -260,7 +286,12 @@ impl<'a> TerminalView<'a> {
                     let mut fg =
                         resolve_color(cell.fg, Color::WHITE, self.user_host_color, self.directory_color);
                     let mut bg = resolve_color(cell.bg, default_bg, self.user_host_color, self.directory_color);
-                    if cell.flags.contains(Flags::INVERSE) || is_cursor || is_selected {
+                    // The cursor is drawn as a translucent overlay after all
+                    // text (see below) so the character underneath stays
+                    // fully legible — swapping fg/bg here as well was what
+                    // made it look like the cursor hid the last-typed
+                    // character instead of just marking its position.
+                    if cell.flags.contains(Flags::INVERSE) || is_selected {
                         std::mem::swap(&mut fg, &mut bg);
                     }
                     CellSnap {
@@ -269,6 +300,7 @@ impl<'a> TerminalView<'a> {
                         c: cell.c,
                         fg,
                         bg,
+                        is_cursor,
                     }
                 })
                 .collect();
@@ -278,10 +310,14 @@ impl<'a> TerminalView<'a> {
 
         let mut run: Option<GlyphRun> = None;
         let mut last_cell: Option<(i32, usize)> = None;
+        let mut cursor_pos: Option<(f32, f32)> = None;
 
         for cell in cells {
             let x = cell.col as f32 * CELL_WIDTH;
             let y = (cell.line + display_offset as i32) as f32 * CELL_HEIGHT;
+            if cell.is_cursor {
+                cursor_pos = Some((x, y));
+            }
 
             let contiguous = last_cell.map_or(false, |(l, c)| l == cell.line && c + 1 == cell.col);
             let same_run = contiguous
@@ -289,7 +325,7 @@ impl<'a> TerminalView<'a> {
 
             if !same_run {
                 if let Some(r) = run.take() {
-                    flush_run(frame, r, default_bg);
+                    flush_run(frame, r, default_bg, bounds.width);
                 }
                 run = Some(GlyphRun { start_x: x, y, fg: cell.fg, bg: cell.bg, text: String::new() });
             }
@@ -297,7 +333,20 @@ impl<'a> TerminalView<'a> {
             last_cell = Some((cell.line, cell.col));
         }
         if let Some(r) = run.take() {
-            flush_run(frame, r, default_bg);
+            flush_run(frame, r, default_bg, bounds.width);
+        }
+
+        // Cursor is a translucent overlay drawn after every character, so
+        // whatever glyph is underneath (if any) stays legible instead of
+        // being replaced by an opaque inverse-video block.
+        if let Some((x, y)) = cursor_pos {
+            if x < bounds.width {
+                frame.fill_rectangle(
+                    cosmic::iced::Point::new(x, y),
+                    cosmic::iced::Size::new(CELL_WIDTH, CELL_HEIGHT),
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+                );
+            }
         }
 
         // NOTE: RenderableContent's exact field name for the current scroll
