@@ -10,8 +10,42 @@ use cosmic::iced::widget::canvas;
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-pub const CELL_WIDTH: f32 = 9.0;
 pub const CELL_HEIGHT: f32 = 18.0;
+
+// Fallback only if measurement somehow fails (e.g. no fonts found at all).
+const DEFAULT_CELL_WIDTH: f32 = 9.0;
+
+static MEASURED_CELL_WIDTH: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+
+/// Real per-glyph advance width, measured the way VTE measures it — open
+/// the actual monospace font and read its true rendered width — rather
+/// than guessing a fixed pixel value. Uses cosmic-text directly (the same
+/// shaping engine iced_wgpu/libcosmic uses internally to draw glyphs),
+/// reading LayoutGlyph::w: the literal advance cosmic-text's own shaper
+/// computes and relies on to place the next glyph. This is ground truth,
+/// not the higher-level aggregate/bounding-box measurement (iced's
+/// Paragraph::min_bounds()) that produced an inaccurate value in an
+/// earlier attempt at this. Measured once and cached — FontSystem::new()
+/// loads every system font and can take up to ~1s, so this should only
+/// ever run a single time, causing a one-time startup pause the first
+/// time cell_width() is called.
+
+pub fn cell_width() -> f32 {
+    *MEASURED_CELL_WIDTH.get_or_init(|| measure_monospace_width().unwrap_or(DEFAULT_CELL_WIDTH))
+}
+
+fn measure_monospace_width() -> Option<f32> {
+    use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+
+    let mut font_system = FontSystem::new();
+    let metrics = Metrics::new(CELL_HEIGHT * 0.85, CELL_HEIGHT);
+    let mut buffer = Buffer::new(&mut font_system, metrics);
+    let mut attrs = Attrs::new();
+    attrs.family = Family::Monospace;
+    buffer.set_text("0", &attrs, Shaping::Advanced, None);
+    buffer.shape_until_scroll(&mut font_system, false);
+    buffer.layout_runs().next()?.glyphs.first().map(|g| g.w)
+}
 
 #[derive(Clone)]
 pub struct EventProxy(UnboundedSender<TermEvent>);
@@ -66,7 +100,7 @@ fn window_size(cols: u16, rows: u16) -> WindowSize {
     WindowSize {
         num_lines: rows,
         num_cols: cols,
-        cell_width: CELL_WIDTH as u16,
+        cell_width: cell_width() as u16,
         cell_height: CELL_HEIGHT as u16,
     }
 }
@@ -134,6 +168,16 @@ impl Terminal {
         self.notifier.notify(data.to_vec());
     }
 
+    /// Pastes text the way every other terminal emulator does: wrapped in
+    /// bracketed-paste markers (`ESC[200~ ... ESC[201~`) if the running
+    /// program (shell/readline/editor) has asked for that mode via DECSET
+    /// 2004h. That lets it treat the paste as literal text instead of
+    /// executing it — the standard defense against a clipboard containing
+    /// a hidden trailing newline + command that would otherwise run the
+    /// instant it's pasted. Any end-marker already present in the pasted
+    /// text is stripped first so it can't be used to split the paste into
+    /// a bracketed half and an unbracketed, executed half.
+    
     pub fn paste(&self, text: &str) {
         let sanitized = text.replace("\x1b[201~", "");
         let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);

@@ -1,5 +1,5 @@
 use crate::pane::{PaneId, SplitDirection};
-use crate::terminal::{Terminal, CELL_HEIGHT, CELL_WIDTH};
+use crate::terminal::{cell_width, Terminal, CELL_HEIGHT};
 use alacritty_terminal::event::Event as TermEvent;
 use cosmic::app::{Core, Task};
 use cosmic::iced::futures::stream;
@@ -48,10 +48,6 @@ pub struct App {
     next_pane_id: PaneId,
     pinned: bool,
     surface_opened_at: Option<Instant>,
-    /// Bumped on every resize event; a debounced save only writes if this
-    /// still matches its own generation after the delay, so a live drag
-    /// resize (many events/sec) doesn't do a synchronous disk write per
-    /// frame — only once, ~300ms after resizing settles.
     resize_save_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -85,7 +81,7 @@ pub enum Message {
 
 fn cols_rows(width: u32, height: u32) -> (u16, u16) {
     let usable_height = (height as f32 - TAB_BAR_HEIGHT).max(CELL_HEIGHT);
-    let cols = ((width as f32 / CELL_WIDTH) as u16).max(1);
+    let cols = ((width as f32 / cell_width()) as u16).max(1);
     let rows = ((usable_height / CELL_HEIGHT) as u16).max(1);
     (cols, rows)
 }
@@ -152,9 +148,6 @@ impl std::hash::Hash for TermSubData {
     }
 }
 
-// NOTE: `Event::Exit` is alacritty_terminal's signal that the pty/child has
-// gone away (e.g. the shell ran `exit`). Verify this variant name against
-// docs.rs for the pinned version if it doesn't match.
 fn term_event_stream(data: &TermSubData) -> impl cosmic::iced::futures::Stream<Item = Message> {
     let rx = data.rx.clone();
     let pane_id = data.id;
@@ -328,13 +321,6 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Uses mouse_area rather than a real Button widget on purpose: buttons
-    /// participate in keyboard Tab-focus traversal, which is exactly what we
-    /// don't want — Tab should only ever reach the terminal for shell
-    /// autocomplete, never cycle focus between these controls. mouse_area has
-    /// no keyboard-focus semantics at all, so there's nothing for Tab to land
-    /// on. Since mouse_area doesn't auto-dim like Button does when disabled,
-    /// we fade the text color manually when `message` is None.
     fn click_label(label: impl Into<String>, message: Option<Message>) -> cosmic::Element<'static, Message> {
         let enabled = message.is_some();
         let mut color: Color = cosmic::theme::active().cosmic().on_bg_color().into();
@@ -589,17 +575,6 @@ impl cosmic::Application for App {
                 self.config.window_height = height.max(300);
                 self.recompute_layout();
 
-                // A live drag-resize fires this event continuously; only
-                // persist once it's been quiet for a moment, off the UI
-                // thread, instead of a synchronous serialize+fs::write per
-                // frame. If a newer resize supersedes this one before the
-                // delay elapses, the generation check below skips the
-                // stale write — the newest one always wins.
-                // NOTE: assumes cosmic::executor::Default keeps a Tokio
-                // runtime entered for the app's lifetime (tokio is already
-                // a direct dependency here for exactly this reason); if
-                // tokio::spawn ever panics with "no reactor running", this
-                // needs a Handle threaded in explicitly instead.
                 let generation = self
                     .resize_save_generation
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)

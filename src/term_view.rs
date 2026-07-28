@@ -1,4 +1,4 @@
-use crate::terminal::{Terminal, CELL_HEIGHT, CELL_WIDTH};
+use crate::terminal::{cell_width, Terminal, CELL_HEIGHT};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -21,7 +21,6 @@ pub struct TerminalView<'a> {
 // Green (index 2/10, NamedColor::Green/BrightGreen/DimGreen) and Blue
 // (index 4/12, NamedColor::Blue/BrightBlue/DimBlue) are overridden by the
 // user's configured colors — the conventional ANSI slots the default
-// Debian/Ubuntu bash prompt uses for user@host and the working directory.
 fn resolve_color(
     c: AnsiColor,
     default: Color,
@@ -81,17 +80,29 @@ fn position_to_point(
     bounds: Rectangle,
     display_offset: usize,
 ) -> GridPoint {
-    let col = ((position.x - bounds.x) / CELL_WIDTH).max(0.0) as usize;
+    let col = ((position.x - bounds.x) / cell_width()).max(0.0) as usize;
     let row = ((position.y - bounds.y) / CELL_HEIGHT) as i32 - display_offset as i32;
     GridPoint::new(Line(row), Column(col))
 }
 
-// Accumulates consecutive same-(fg,bg) cells on a row so they render as one
-// glyph run instead of one shaping call per character. Positioned by grid
-// column (start_x), not by cumulative glyph advance, so a run always starts
-// exactly on-grid regardless of font metrics — only intra-run spacing
-// depends on the monospace font's advance matching CELL_WIDTH, which this
-// file already assumes everywhere (PTY sizing, mouse-to-cell mapping).
+// Renders one glyph per fill_text call, each positioned explicitly at its
+// own exact grid column. This is intentionally NOT batched into
+// multi-character runs — three separate attempts at that (a fixed
+// CELL_WIDTH guess, iced's high-level Paragraph::min_bounds(), and a
+// verified ground-truth read of cosmic-text's own LayoutGlyph::w) all
+// still produced overlapping text in practice. The reason isn't
+// measurement quality: a canvas::Program has no way to reach into the
+// live renderer's actual FontSystem instance, so nothing we measure on
+// our own can be proven to match the font it actually draws with. VTE's
+// (Terminator) real behavior confirms this is the right call, not a workaround:
+// VTE renders "every character cell... individually" regardless of how well
+// it measures the font — measurement there is only used to size the grid
+// (report accurate cols/rows to the child process), never to justify
+// batching draw calls. Per-glyph positioning tolerates an imperfect
+// cell_width() gracefully (worst case: slightly off-looking spacing);
+// batching amplifies the same error into overlap. Do not re-attempt
+// batching here without a way to verify the measurement against the
+// live renderer directly.
 struct GlyphRun {
     start_x: f32,
     y: f32,
@@ -101,16 +112,14 @@ struct GlyphRun {
 }
 
 fn flush_run(frame: &mut canvas::Frame, run: GlyphRun, default_bg: Color, max_width: f32) {
-    // Never draw past this pane's own right edge. CELL_WIDTH is a fixed
-    // guess at the monospace font's advance, not a measured value — if the
-    // real glyph width is even slightly wider, a line sized to fit the
-    // reported column count can overflow in actual pixels and bleed into
-    // whatever renders next (a neighboring split pane). Clip here so that's
-    // contained regardless of the underlying metric mismatch.
+    // Never draw past this pane's own right edge — a line whose reported
+    // column count doesn't precisely match its rendered pixel width
+    // shouldn't be able to bleed into a neighboring split pane.
     if run.start_x >= max_width {
         return;
     }
-    let available_cols = ((max_width - run.start_x) / CELL_WIDTH).floor().max(0.0) as usize;
+    let cw = cell_width();
+    let available_cols = ((max_width - run.start_x) / cw).floor().max(0.0) as usize;
     if available_cols == 0 {
         return;
     }
@@ -119,25 +128,17 @@ fn flush_run(frame: &mut canvas::Frame, run: GlyphRun, default_bg: Color, max_wi
     if run.bg != default_bg {
         frame.fill_rectangle(
             cosmic::iced::Point::new(run.start_x, run.y),
-            cosmic::iced::Size::new(CELL_WIDTH * len, CELL_HEIGHT),
+            cosmic::iced::Size::new(cw * len, CELL_HEIGHT),
             run.bg,
         );
     }
-    // Each glyph is placed explicitly at its own exact grid column instead
-    // of one fill_text call trusting the font's natural multi-character
-    // advance to match CELL_WIDTH. A batched call was cheaper, but even a
-    // small per-glyph metric error compounds across a run's length, and
-    // once the drift exceeds a fraction of a cell it visually overlaps
-    // into the next same-line color run — that was the cause of the
-    // garbled/overlapping text. Per-glyph positioning is exact regardless
-    // of the font's real advance.
     for (i, ch) in chars.into_iter().enumerate() {
         if ch == ' ' {
             continue;
         }
         frame.fill_text(canvas::Text {
             content: ch.to_string(),
-            position: cosmic::iced::Point::new(run.start_x + i as f32 * CELL_WIDTH, run.y),
+            position: cosmic::iced::Point::new(run.start_x + i as f32 * cw, run.y),
             color: run.fg,
             size: cosmic::iced::Pixels(CELL_HEIGHT * 0.85),
             font: cosmic::iced::Font::MONOSPACE,
@@ -165,10 +166,6 @@ pub struct TermViewState {
 impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<'a> {
     type State = TermViewState;
 
-    // NOTE: Selection/Side/SelectionType paths and Selection::update's exact
-    // signature are best-effort guesses against alacritty_terminal 0.26 —
-    // expect to need one more correction round here, consistent with the
-    // rest of this crate's API surface throughout this build.
     fn update(
         &self,
         state: &mut TermViewState,
@@ -237,7 +234,7 @@ impl<'a> canvas::Program<crate::app::Message, Theme, Renderer> for TerminalView<
         bounds: Rectangle,
         _cursor: cosmic::iced::mouse::Cursor,
     ) -> Vec<Geometry> {
-        let cols = ((bounds.width / CELL_WIDTH) as u16).max(1);
+        let cols = ((bounds.width / cell_width()) as u16).max(1);
         let rows = ((bounds.height / CELL_HEIGHT) as u16).max(1);
         self.terminal.resize_if_changed(cols, rows);
 
@@ -262,13 +259,6 @@ impl<'a> TerminalView<'a> {
 
         let default_bg = Color::from_rgb8(30, 30, 30);
 
-        // Snapshot resolved per-cell color/text while the terminal is
-        // locked, bounded by the visible viewport (not scrollback), then
-        // release the lock before any Frame/text-shaping work below.
-        // alacritty's PTY reader thread needs this same lock to write
-        // incoming bytes into the grid — holding it for the whole draw
-        // pass serialized rendering against new output arriving, which is
-        // exactly what nano's rapid repaints would stall on.
         let (cells, total_lines, screen_lines, display_offset) = {
             let term = self.terminal.term.lock();
             let selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
@@ -311,9 +301,10 @@ impl<'a> TerminalView<'a> {
         let mut run: Option<GlyphRun> = None;
         let mut last_cell: Option<(i32, usize)> = None;
         let mut cursor_pos: Option<(f32, f32)> = None;
+        let cw = cell_width();
 
         for cell in cells {
-            let x = cell.col as f32 * CELL_WIDTH;
+            let x = cell.col as f32 * cw;
             let y = (cell.line + display_offset as i32) as f32 * CELL_HEIGHT;
             if cell.is_cursor {
                 cursor_pos = Some((x, y));
@@ -343,7 +334,7 @@ impl<'a> TerminalView<'a> {
             if x < bounds.width {
                 frame.fill_rectangle(
                     cosmic::iced::Point::new(x, y),
-                    cosmic::iced::Size::new(CELL_WIDTH, CELL_HEIGHT),
+                    cosmic::iced::Size::new(cw, CELL_HEIGHT),
                     Color::from_rgba(1.0, 1.0, 1.0, 0.45),
                 );
             }
